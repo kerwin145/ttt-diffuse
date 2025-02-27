@@ -13,6 +13,8 @@ import torch.multiprocessing as mp
 
 from PoseTransformer import PoseTransformer, CrossModalTransformer
 from NoiseScheduler import NoiseScheduler
+from utils.motion_process import recover_from_ric
+
 mp.set_start_method("spawn", force=True)
 
 BATCH_SIZE = 8
@@ -27,6 +29,24 @@ test_list = open(pjoin(src_dir, "test.txt"), "r", encoding="utf-8")
 clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 
+   
+def fourier_embedding(x, num_frequencies=10):
+    """
+    Applies Fourier feature encoding to the input tensor.
+    x: (seq_len, 3) - The trajectory data (X, Y, Z)
+    num_frequencies: The number of frequency bands
+    """
+    seq_len, dim = x.shape  # dim = 3 (X, Y, Z)
+    
+    # Define frequency bands: log-spaced
+    freqs = torch.logspace(0.0, np.log10(1000.0), num_frequencies)  # Frequencies in range [1, 1000]
+    
+    # Compute sin and cos embeddings for each frequency
+    x_proj = x.unsqueeze(-1) * freqs  # Shape: (seq_len, 3, num_frequencies)
+    fourier_features = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)  # (seq_len, 3, 2*num_frequencies)
+    
+    return fourier_features.view(seq_len, -1)  # Flatten to (seq_len, 3 * 2 * num_frequencies)
+
 class PoseTextDataset(Dataset):
     """
         (data_dir): contains all the new_joint_vecs
@@ -34,10 +54,11 @@ class PoseTextDataset(Dataset):
         (max_len): max length of text descriptions
     """
 
-    def __init__(self, src_dir, setting, tokenizer, max_len=256, use_percentage = 1.0):
+    def __init__(self, src_dir, setting, tokenizer, joint_num, max_len=256, use_percentage = 1.0):
         self.src_dir = src_dir
         self.max_len = max_len
         self.tokenizer = tokenizer
+        self.joint_num = joint_num 
 
         if setting not in ["train", "train_temp", "val", "test", "all"]:
             print("Invalid setting. Must be train, val, test, or all.")
@@ -53,7 +74,7 @@ class PoseTextDataset(Dataset):
 
     def __len__(self):
         return len(self.file_list)
-
+ 
     def __getitem__(self, index):
         file = self.file_list[index]
 
@@ -82,6 +103,11 @@ class PoseTextDataset(Dataset):
         # Since tokenizer returns tensors in a dictionary, we can access them directly
         input_ids = encoded_texts["input_ids"]
         attention_mask = encoded_texts["attention_mask"]
+
+        world_joints = recover_from_ric(torch.from_numpy(pose_data).float(), self.joint_num).numpy()
+        root_positions  =world_joints[:, 0, :] # get trajectory from root position
+        fourier_encoded_traj = fourier_embedding(root_positions)
+        
 
         # Return a list of dictionaries, one per description
         return [{
@@ -247,11 +273,11 @@ def main():
 
     EMBEDDING_DIM = 512
 
-    trainDataset = PoseTextDataset(src_dir=src_dir,setting="train",tokenizer=clip_tokenizer,max_len=77,use_percentage=0.2)
+    trainDataset = PoseTextDataset(src_dir=src_dir,setting="train",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=0.2)
     trainDataLoader = DataLoader(trainDataset,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,collate_fn=collate_fn)
     # persistent_workers=True,
     # multiprocessing_context="spawn"
-    evalDataset = PoseTextDataset(src_dir=src_dir,setting="val",tokenizer=clip_tokenizer,max_len=77,use_percentage=1)
+    evalDataset = PoseTextDataset(src_dir=src_dir,setting="val",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=1)
     evalDataLoader = DataLoader(evalDataset,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,collate_fn=collate_fn)
 
     pose_transformer = PoseTransformer(
