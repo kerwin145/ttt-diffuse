@@ -77,7 +77,7 @@ class PoseTransformer(BaseTransformer):
             pose_mask = pose_mask == 0  # Convert to bool for transformer (1 is padding in mask)
         encoded_poses = self.transformer_encoder(pose_embeddings, src_key_padding_mask=pose_mask)
 
-        return encoded_poses.transpose(0, 1)  # Back to (batch_size, seq_len, embedding_dim)
+        return encoded_poses 
         # return encoded_poses
 
 class CrossModalTransformer(BaseTransformer):
@@ -91,30 +91,24 @@ class CrossModalTransformer(BaseTransformer):
             raise ValueError("CrossModalTransformer requires a decoder, but use_decoder=False was given.")
 
     def forward(self, poses, memory, pose_mask=None, memory_mask=None):
-        poses = poses.transpose(0, 1)
         projected_poses = self.input_projection(poses)
         pose_embeddings = self.add_positional_encoding(projected_poses, self.positional_encoding)
-        # since embedding is already done, no need to add additional positional embedding
-        memory_embeddings = self.memory_projection(memory).unsqueeze(1)
-        # memory_embeddings = memory_embeddings.transpose(0, 1) # commented because dimension is already (batch, 1, embedding_dim)
-
+        if memory.dim() == 2:  # [batch_size, memory_dim]
+            # If memory is 2D, project and add sequence dimension
+            memory_embeddings = self.memory_projection(memory).unsqueeze(1)  # [batch_size, 1, embedding_dim]
+        elif memory.dim() == 3:  # [batch_size, memory_seq_len, memory_dim]
+            memory_embeddings = self.memory_projection(memory)
         if pose_mask is not None:
             pose_mask = pose_mask == 0  # Convert to boolean
             if pose_mask.shape[0] != poses.shape[0]:  # Ensure batch-first format
                 pose_mask = pose_mask.transpose(0, 1)  # Convert (seq_len, batch) -> (batch, seq_len)
 
-        if memory_mask is not None:
-            memory_mask = memory_mask == 0
-            if memory_mask.shape[0] != memory.shape[0]:  # Ensure batch-first format
-                memory_mask = memory_mask.transpose(0, 1)  # Convert (seq_len, batch) -> (batch, seq_len)
-
-        # print("pose_embeddings", pose_embeddings.shape)
-        # print("memory_embeddings", memory_embeddings.shape)
-        # print("pose mask" , pose_mask.shape)
         # if memory_mask is not None:
-            # print("memory mask" , memory_mask.shape)
+        #     memory_mask = memory_mask == 0
+        #     if memory_mask.shape[0] != memory.shape[0]:  # Ensure batch-first format
+        #         memory_mask = memory_mask.transpose(0, 1)  # Convert (seq_len, batch) -> (batch, seq_len)
 
-        # Cross-attend poses with text
+        # Cross-attend poses with memory
         output = self.transformer_decoder(pose_embeddings, memory_embeddings, tgt_key_padding_mask=pose_mask, memory_key_padding_mask=memory_mask)
 
-        return output.transpose(0, 1)
+        return output
