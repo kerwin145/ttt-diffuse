@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence 
 from tqdm import tqdm
 import torch.multiprocessing as mp
+from torch.optim.lr_scheduler import LambdaLR
 
 from PoseTransformer import PoseTransformer, CrossModalTransformer
 from NoiseScheduler import NoiseScheduler
@@ -18,7 +19,7 @@ from utils.motion_process import recover_from_ric
 mp.set_start_method("spawn", force=True)
 
 BATCH_SIZE = 8
-EPOCHS = 3
+EPOCHS = 6
 SAVE_PATH = "model_output"
 
 src_dir = "..\\HumanML3D"
@@ -166,85 +167,95 @@ class Trainer:
             list(self.text_cross_transformer.parameters()) +
             list(self.trajectory_cross_transformer.parameters()) +
             list(self.noise_predictor.parameters()),
-            lr=1e-4,
+            lr=1e-3,
             weight_decay=1e-2
         )
+
+        self.warmup_steps = 1000  # Adjust based on your needs
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda=self.get_lr_lambda())
 
         self.pose_transformer.train()
         self.text_cross_transformer.train()
         self.trajectory_cross_transformer.train()
         self.noise_predictor.train()
+    def get_lr_lambda(self):
+        return lambda step: min((step + 1) / self.warmup_steps, 1.0)
+    
+    def _process_batch(self, batch):
+        poses = batch["pose"].to(self.device)
+        pose_mask = batch["pose_mask"].to(self.device)
+        texts = batch["text"].to(self.device)
+        text_mask = batch["attention_mask"].to(self.device)
+        trajectory = batch["trajectory"].to(self.device)
 
-    def train(self, dataloader, optimizer = None):
+        # Denoiser setup
+        batch_size = poses.shape[0]
+        noise = torch.randn_like(poses)
+        timesteps = self.noise_scheduler.sample_timesteps(batch_size, device=self.device)
+        noisy_poses = self.noise_scheduler.add_noise(poses, noise, timesteps)
+
+        # Get text embeddings from CLIP
+        text_inputs = {
+            "input_ids": texts,
+            "attention_mask": text_mask
+        }
+        text_embeddings = self.clip_model.get_text_features(**text_inputs)
+
+        pose_embeddings = self.pose_transformer(
+            noisy_poses,
+            pose_mask=pose_mask,
+            timesteps=timesteps
+        )
+
+        trajectory_conditioned_embeddings = self.trajectory_cross_transformer(
+            pose_embeddings,
+            trajectory,
+            pose_mask=pose_mask,
+            memory_mask=pose_mask
+        )
+
+        # Cross-attention with text embeddings
+        text_conditioned_embeddings = self.text_cross_transformer(
+            trajectory_conditioned_embeddings,
+            text_embeddings,
+            pose_mask=pose_mask,
+            memory_mask=None
+        )
+        # Predict noise
+        predicted_noise = self.noise_predictor(text_conditioned_embeddings)
+        return predicted_noise, noise
+
+    def train(self, dataloader, optimizer=None):
         self.pose_transformer.train()
         self.text_cross_transformer.train()
+        self.trajectory_cross_transformer.train()
         self.noise_predictor.train()
-        if optimizer is None:  # Default to using the initialized optimizer
+        if optimizer is None:
             optimizer = self.optimizer
 
-        total_loss = 0  # Track total loss for the epoch
+        total_loss = 0
         num_batches = len(dataloader)
 
         for batch in tqdm(dataloader, leave=True):
-            poses = batch["pose"].to(self.device)  # (batch_size, max_pose_len, features)
-            pose_mask = batch["pose_mask"].to(self.device)
-            texts = batch["text"].to(self.device)  # (batch_size, max_text_len)
-            text_mask = batch["attention_mask"].to(self.device)  # Attention mask for text
-            trajectory = batch["trajectory"].to(self.device)
+            predicted_noise, noise = self._process_batch(batch)
 
-            # Denoiser setup
-            batch_size = poses.shape[0]
-            noise = torch.randn_like(poses)
-            timesteps = self.noise_scheduler.sample_timesteps(batch_size, device=self.device)
-            noisy_poses = self.noise_scheduler.add_noise(poses, noise, timesteps)
-
-            # Get text embeddings from CLIP
-            text_inputs = {
-                "input_ids": texts,
-                "attention_mask": text_mask
-            }
-            text_embeddings = self.clip_model.get_text_features(**text_inputs)  # Shape: (batch_size, embedding_dim)
-
-            pose_embeddings = self.pose_transformer(
-                noisy_poses,
-                pose_mask=pose_mask,
-                timesteps=timesteps
-            )
-
-            # Cross-attention with text embeddings
-            # print("Cross text embeddings")
-            # print(pose_embeddings.shape)
-            # print(text_embeddings.shape)
-            # print(pose_mask.shape)
-            # print(text_mask.shape)
-            text_conditioned_embeddings = self.text_cross_transformer(
-                pose_embeddings,
-                text_embeddings,
-                pose_mask=pose_mask,
-                memory_mask=None # None because, text embeddings is a batch of 1D vectors that clip model outputs. I will have it attended each pose
-            )
-
-            # Cross-attention with trajectory embeddings
-            # print("Cross traj embeddings")
-            # print(text_conditioned_embeddings.shape)
-            # print(trajectory.shape)
-            # print(pose_mask.shape)
-            trajectory_conditioned_embeddings = self.trajectory_cross_transformer(
-                text_conditioned_embeddings,
-                trajectory,
-                pose_mask=pose_mask,
-                memory_mask=pose_mask
-            )
-            # Predict noise (output shape: batch_size, seq_len, pose_features)
-            predicted_noise = self.noise_predictor(trajectory_conditioned_embeddings)
-            # Compute MSE loss (equivalent to KL divergence in this context)
+            # Compute MSE loss
             loss = torch.nn.functional.mse_loss(predicted_noise, noise)
 
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.pose_transformer.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.text_cross_transformer.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.trajectory_cross_transformer.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.noise_predictor.parameters(), 1.0)
+            
             optimizer.step()
+            self.lr_scheduler.step()
 
             total_loss += loss.item()
+
         return total_loss / num_batches
 
     def eval(self, dataloader):
@@ -252,54 +263,17 @@ class Trainer:
         self.text_cross_transformer.eval()
         self.trajectory_cross_transformer.eval()
         self.noise_predictor.eval()
+        
         with torch.no_grad():
             total_loss = 0
             for batch in tqdm(dataloader, leave=True):
-                poses = batch["pose"].to(self.device)  # (batch_size, max_pose_len, features)
-                pose_mask = batch["pose_mask"].to(self.device)
-                texts = batch["text"].to(self.device)  # (batch_size, max_text_len)
-                text_mask = batch["attention_mask"].to(self.device)  # Attention mask for text
-                trajectory = batch["trajectory"].to(self.device)
+                predicted_noise, noise = self._process_batch(batch)
 
-                # Denoiser setup
-                batch_size = poses.shape[0]
-                noise = torch.randn_like(poses)
-                timesteps = self.noise_scheduler.sample_timesteps(batch_size, device=self.device)
-                noisy_poses = self.noise_scheduler.add_noise(poses, noise, timesteps)
-
-                # Get text embeddings from CLIP
-                text_inputs = {
-                    "input_ids": texts,
-                    "attention_mask": text_mask
-                }
-                text_embeddings = self.clip_model.get_text_features(**text_inputs)  # Shape: (batch_size, embedding_dim)
-
-                pose_embeddings = self.pose_transformer(
-                    noisy_poses,
-                    pose_mask=pose_mask,
-                    timesteps=timesteps
-                )
-
-                # Cross-attention with text embeddings
-                text_conditioned_embeddings = self.text_cross_transformer(
-                    pose_embeddings,
-                    text_embeddings,
-                    pose_mask=pose_mask,
-                    memory_mask=None
-                )
-
-                trajectory_conditioned_embeddings = self.trajectory_cross_transformer(
-                    text_conditioned_embeddings,
-                    trajectory,
-                    pose_mask=pose_mask,
-                    memory_mask=pose_mask
-                )
-              # Predict noise (output shape: batch_size, seq_len, pose_features)
-                predicted_noise = self.noise_predictor(trajectory_conditioned_embeddings)
-              # Compute MSE loss (equivalent to KL divergence in this context)
+                # Compute MSE loss
                 loss = torch.nn.functional.mse_loss(predicted_noise, noise)
                 total_loss += loss.item()
-        return total_loss/len(dataloader)
+
+        return total_loss / len(dataloader)
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -313,12 +287,12 @@ def main():
     EMBEDDING_DIM = 512
 
     print("Loading Train dataset")
-    trainDataset = PoseTextDataset(src_dir=src_dir,setting="train",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=.005)
+    trainDataset = PoseTextDataset(src_dir=src_dir,setting="train",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=.20)
     trainDataLoader = DataLoader(trainDataset,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,collate_fn=collate_fn)
     # persistent_workers=True,
     # multiprocessing_context="spawn"
     print("Loading Eval Dataset")
-    evalDataset = PoseTextDataset(src_dir=src_dir,setting="val",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=0.02)
+    evalDataset = PoseTextDataset(src_dir=src_dir,setting="val",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=1)
     evalDataLoader = DataLoader(evalDataset,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,collate_fn=collate_fn)
     print("Dataset loading done")
     pose_transformer = PoseTransformer(
@@ -377,6 +351,7 @@ def main():
         train_losses.append(trainLoss)
         evalLoss = trainer.eval(evalDataLoader)
         eval_losses.append(evalLoss)
+        print("Trian loss: ", trainLoss, "Eval loss: ", evalLoss)
 
     plt.figure(figsize=(10, 5))
     plt.plot(range(1, EPOCHS + 1), train_losses, marker='o', linestyle='-', color='b', label="Train Loss")
