@@ -19,12 +19,15 @@ from utils.motion_process import recover_from_ric
 mp.set_start_method("spawn", force=True)
 
 BATCH_SIZE = 8
-EPOCHS = 8
+EPOCHS = 6
 SAVE_PATH = "model_output"
 
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-2
-PERCENT_TRAIN = .75
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
+PERCENT_TRAIN = .7
+
+EMBEDDING_DIM = 512 
+POSE_FEATURES_DIM = 263
 
 src_dir = "..\\HumanML3D"
 train_list = open(pjoin(src_dir, "train.txt"), "r", encoding="utf-8")
@@ -319,8 +322,6 @@ def main():
     np.random.seed(SEED)  # NumPy random
     torch.manual_seed(SEED)  # PyTorch random
 
-    EMBEDDING_DIM = 512
-
     checkpoint_path = f"model_saves/TT_{PERCENT_TRAIN}_percentdata_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}"
 
     print("Loading Train dataset")
@@ -368,7 +369,7 @@ def main():
         "pose_transformer": pose_transformer,
         "text_cross_transformer": text_cross_transformer,
         # "trajectory_cross_transformer": trajectory_cross_transformer,
-        "pose_features_dim": 263,
+        "pose_features_dim": POSE_FEATURES_DIM,
         "embedding_dim": EMBEDDING_DIM
     }, checkpoint_path=checkpoint_path)
     # Print for each model

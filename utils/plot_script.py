@@ -25,7 +25,6 @@ def list_cut_average(ll, intervals):
 
 def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), fps=120, radius=4):
     matplotlib.use('Agg')
-
     title_sp = title.split(' ')
     if len(title_sp) > 20:
         title = '\n'.join([' '.join(title_sp[:10]), ' '.join(title_sp[10:20]), ' '.join(title_sp[20:])])
@@ -92,7 +91,6 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), f
                       color='blue')
         #             ax = plot_xzPlane(ax, MINS[0], MAXS[0], 0, MINS[2], MAXS[2])
         
-        
         for i, (chain, color) in enumerate(zip(kinematic_tree, colors)):
 #             print(color)
             if i < 5:
@@ -100,7 +98,7 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), f
             else:
                 linewidth = 2.0
             ax.plot3D(data[index, chain, 0], data[index, chain, 1], data[index, chain, 2], linewidth=linewidth, color=color)
-        #         print(trajec[:index, 0].shape)
+            print(trajec[:index, 0].shape)
 
         plt.axis('off')
         ax.set_xticklabels([])

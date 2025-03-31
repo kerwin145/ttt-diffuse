@@ -58,6 +58,7 @@ class PoseTransformer(BaseTransformer):
     def __init__(self, pose_dim, embedding_dim, num_heads, num_layers, num_timesteps = 1000, use_encoder = True, use_decoder= False, max_seq_len=512, dropout=0.1):
         super().__init__(pose_dim, embedding_dim, num_heads, num_layers, use_encoder, use_decoder, max_seq_len, dropout)
 
+        print(num_timesteps)
         self.timestep_embedding = nn.Embedding(num_timesteps, embedding_dim)
 
         if use_encoder:
@@ -69,7 +70,6 @@ class PoseTransformer(BaseTransformer):
         # Project pose features to embedding space
         projected_poses = self.input_projection(poses) # Shape: (batch_size, seq_len, embedding_dim)
         pose_embeddings = self.add_positional_encoding(projected_poses, self.positional_encoding)
-
         t_emb = self.timestep_embedding(timesteps)  # (batch_size, embedding_dim)
         pose_embeddings += t_emb.unsqueeze(1)  # Broadcast to (batch_size, seq_len, embedding_di
 
