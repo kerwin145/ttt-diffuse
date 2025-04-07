@@ -19,12 +19,12 @@ from utils.motion_process import recover_from_ric
 mp.set_start_method("spawn", force=True)
 
 BATCH_SIZE = 8
-EPOCHS = 6
+EPOCHS = 5
 SAVE_PATH = "model_output"
 
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
-PERCENT_TRAIN = .7
+PERCENT_TRAIN = .3
 
 EMBEDDING_DIM = 512 
 POSE_FEATURES_DIM = 263
@@ -222,7 +222,7 @@ class Trainer:
         pose_mask = batch["pose_mask"].to(self.device)
         texts = batch["text"].to(self.device)
         text_mask = batch["attention_mask"].to(self.device)
-        trajectory = batch["trajectory"].to(self.device)
+        # trajectory = batch["trajectory"].to(self.device)
 
         # Denoiser setup
         batch_size = poses.shape[0]
@@ -261,7 +261,7 @@ class Trainer:
         predicted_noise = self.noise_predictor(text_conditioned_embeddings)
         return predicted_noise, noise
 
-    def train(self, optimizer=None):
+    def train(self, optimizer=None, accumulation_steps = 4):
         dataloader = self.train_dataloader
         self.pose_transformer.train()
         self.text_cross_transformer.train()
@@ -273,23 +273,25 @@ class Trainer:
         total_loss = 0
         num_batches = len(dataloader)
 
-        for batch in tqdm(dataloader, leave=True):
+        optimizer.zero_grad()
+
+        for i, batch in enumerate(tqdm(dataloader, leave=True)):
             predicted_noise, noise = self._process_batch(batch)
 
             # Compute MSE loss
             loss = torch.nn.functional.mse_loss(predicted_noise, noise)
-
-            optimizer.zero_grad()
+            loss = loss / accumulation_steps
             loss.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.pose_transformer.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(self.text_cross_transformer.parameters(), 1.0)
-            # torch.nn.utils.clip_grad_norm_(self.trajectory_cross_transformer.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(self.noise_predictor.parameters(), 1.0)
-            
-            optimizer.step()
-            self.lr_scheduler.step()
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == num_batches: #accumulate gradients, and then update.
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.pose_transformer.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.text_cross_transformer.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.noise_predictor.parameters(), 1.0)
+
+                optimizer.step()
+                optimizer.zero_grad()
+                self.lr_scheduler.step()
 
             total_loss += loss.item()
 
@@ -322,7 +324,7 @@ def main():
     np.random.seed(SEED)  # NumPy random
     torch.manual_seed(SEED)  # PyTorch random
 
-    checkpoint_path = f"model_saves/TT_{PERCENT_TRAIN}_percentdata_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}"
+    checkpoint_path = f"model_saves/Acc_TT_{PERCENT_TRAIN}_percentdata_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}"
 
     print("Loading Train dataset")
     trainDataset = PoseTextDataset(src_dir=src_dir,setting="train",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=PERCENT_TRAIN)
@@ -337,7 +339,7 @@ def main():
         pose_dim=263,
         embedding_dim=EMBEDDING_DIM,  # Match CLIP's embedding dimension
         num_heads=8,  # Number of attention heads
-        num_layers=6,  # Number of transformer layers
+        num_layers=8,  # Number of transformer layers
         dropout=0.1,  # Dropout probability,
         use_decoder=False
     )
@@ -347,7 +349,7 @@ def main():
         memory_dim= EMBEDDING_DIM,
         embedding_dim=EMBEDDING_DIM,
         num_heads=8,
-        num_layers=6,
+        num_layers=8,
         use_decoder=True
     )
 
