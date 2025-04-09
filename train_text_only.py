@@ -1,15 +1,17 @@
 import os
 import random
 import re
+import math
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.multiprocessing as mp
 import matplotlib.pyplot as plt
 from os.path import join as pjoin
 from transformers import CLIPModel, CLIPTokenizer
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence 
 from tqdm import tqdm
-import torch.multiprocessing as mp
 from transformers import get_cosine_schedule_with_warmup
 
 from PoseTransformer import PoseTransformer, CrossModalTransformer
@@ -19,12 +21,13 @@ from utils.motion_process import recover_from_ric
 mp.set_start_method("spawn", force=True)
 
 BATCH_SIZE = 8
-EPOCHS = 5
+ACCUMULATION_STEPS = 4
+EPOCHS = 7
 SAVE_PATH = "model_output"
 
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 3e-5
 WEIGHT_DECAY = 1e-4
-PERCENT_TRAIN = .3
+PERCENT_TRAIN = .8
 
 EMBEDDING_DIM = 512 
 POSE_FEATURES_DIM = 263
@@ -119,8 +122,8 @@ class PoseTextDataset(Dataset):
         # Return a list of dictionaries, one per description
         return [{
             "pose": pose_tensor,
-            "text": input_ids[i],  # Squeeze unnecessary dimensions
-            "attention_mask": attention_mask[i],  # Squeeze unnecessary dimensions
+            "text": input_ids[i],
+            "attention_mask": attention_mask[i],
             "trajectory": fourier_encoded_traj
         } for i in range(len(text_descriptions))]
 
@@ -167,7 +170,8 @@ class Trainer:
         self.text_cross_transformer = options['text_cross_transformer'].to(self.device)
         # self.trajectory_cross_transformer = options['trajectory_cross_transformer'].to(self.device)
         self.pose_features_dim = options['pose_features_dim']
-        self.noise_predictor = torch.nn.Linear(options['embedding_dim'], self.pose_features_dim).to(self.device)
+        self.noise_predictor = options['noise_predictor'].to(self.device)
+        self.accumulation_steps = options['accumulation_steps']
 
         self.noise_scheduler = NoiseScheduler(timesteps=1000)
         # clip is left out of the optimizer, as we won't be tuning CLIP model
@@ -180,13 +184,17 @@ class Trainer:
             weight_decay=WEIGHT_DECAY
         )
 
-        training_steps = len(self.train_dataloader) * EPOCHS
-        warmup_steps = int(training_steps * 0.05)
-        self.lr_scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=warmup_steps,  # Gradually increase LR
-            num_training_steps=training_steps  # Cosine decay over training
-        )
+        num_batches = len(self.train_dataloader) // ACCUMULATION_STEPS
+        # Add 1 if there are leftover batches that will trigger an optimizer step
+        # if len(self.train_dataloader) % ACCUMULATION_STEPS != 0:
+        #     num_batches += 1
+        # training_steps = num_batches * EPOCHS
+        # warmup_steps = int(training_steps * 0.05)
+        # self.lr_scheduler = get_cosine_schedule_with_warmup(
+        #     self.optimizer,
+        #     num_warmup_steps=warmup_steps,  # Gradually increase LR
+        #     num_training_steps=training_steps  # Cosine decay over training
+        # )
 
         self.pose_transformer.train()
         self.text_cross_transformer.train()
@@ -236,6 +244,7 @@ class Trainer:
             "attention_mask": text_mask
         }
         text_embeddings = self.clip_model.get_text_features(**text_inputs)
+        # print(f"Noisy poses dimensions: {noisy_poses.shape}")
 
         pose_embeddings = self.pose_transformer(
             noisy_poses,
@@ -259,9 +268,11 @@ class Trainer:
         )
         # Predict noise
         predicted_noise = self.noise_predictor(text_conditioned_embeddings)
+        # print(f"Predicted noise dimensions: {noisy_poses.shape}")
+
         return predicted_noise, noise
 
-    def train(self, optimizer=None, accumulation_steps = 4):
+    def train(self, optimizer=None):
         dataloader = self.train_dataloader
         self.pose_transformer.train()
         self.text_cross_transformer.train()
@@ -280,10 +291,10 @@ class Trainer:
 
             # Compute MSE loss
             loss = torch.nn.functional.mse_loss(predicted_noise, noise)
-            loss = loss / accumulation_steps
+            loss = loss / self.accumulation_steps
             loss.backward()
 
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == num_batches: #accumulate gradients, and then update.
+            if (i + 1) % self.accumulation_steps == 0 or (i + 1) == num_batches: #accumulate gradients, and then update.
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.pose_transformer.parameters(), 1.0)
                 torch.nn.utils.clip_grad_norm_(self.text_cross_transformer.parameters(), 1.0)
@@ -291,7 +302,7 @@ class Trainer:
 
                 optimizer.step()
                 optimizer.zero_grad()
-                self.lr_scheduler.step()
+                # self.lr_scheduler.step()
 
             total_loss += loss.item()
 
@@ -317,6 +328,31 @@ class Trainer:
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def init_weights_transformer(module):
+    """
+    Initialize weights using Transformer-style N(0, 0.02) for Linear & Embedding.
+    Initialize LayerNorm weights to 1 and biases to 0.
+    """
+    std_dev = 0.02 # Standard deviation for normal initialization
+    if isinstance(module, nn.Linear):
+        # Normal initialization for weights
+        nn.init.normal_(module.weight, mean=0.0, std=std_dev)
+        # Zero initialization for biases if they exist
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        # Normal initialization for embedding weights
+        nn.init.normal_(module.weight, mean=0.0, std=std_dev)
+        # Zero out padding embedding if it exists
+        if module.padding_idx is not None:
+            with torch.no_grad(): # Ensure this operation isn't tracked by autograd
+                module.weight[module.padding_idx].fill_(0)
+    elif isinstance(module, nn.LayerNorm):
+        # Initialize weights (gamma) to 1
+        nn.init.ones_(module.weight)
+        # Initialize biases (beta) to 0
+        nn.init.zeros_(module.bias)
 
 def main():
     SEED = 42
@@ -353,6 +389,12 @@ def main():
         use_decoder=True
     )
 
+    noise_predictor = torch.nn.Linear(EMBEDDING_DIM, POSE_FEATURES_DIM)
+
+    pose_transformer.apply(init_weights_transformer)
+    text_cross_transformer.apply(init_weights_transformer)
+    noise_predictor.apply(init_weights_transformer) # Apply standard init first
+
     # trajectory_cross_transformer = CrossModalTransformer(
     #     pose_dim = EMBEDDING_DIM,
     #     memory_dim= 60,
@@ -370,9 +412,11 @@ def main():
         "clip_tokenizer": clip_tokenizer,
         "pose_transformer": pose_transformer,
         "text_cross_transformer": text_cross_transformer,
+        "noise_predictor": noise_predictor,
         # "trajectory_cross_transformer": trajectory_cross_transformer,
         "pose_features_dim": POSE_FEATURES_DIM,
-        "embedding_dim": EMBEDDING_DIM
+        "embedding_dim": EMBEDDING_DIM,
+        "accumulation_steps": ACCUMULATION_STEPS,
     }, checkpoint_path=checkpoint_path)
     # Print for each model
     print(f"Pose Transformer Parameters: {count_parameters(trainer.pose_transformer)}")
