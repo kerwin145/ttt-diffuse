@@ -89,7 +89,7 @@ class PoseTextDataset(Dataset):
     def __getitem__(self, index):
         file = self.file_list[index]
 
-        # Load post data
+        # Load pose data
         pose_path = pjoin(self.src_dir, "new_joint_vecs", f"{file}.npy")
         pose_data = np.load(pose_path)  # Shape: (frames, joints, features)
         pose_tensor = torch.tensor(pose_data, dtype=torch.float32)
@@ -131,8 +131,10 @@ def collate_fn(batch):
     """
     Pads all pose sequences to the maximum length in the batch.
     """
+    print(f"Shape of batch: {batch.shape}")
     flattened_batch = [item for sublist in batch for item in sublist]
-
+    print(f"Shape of flattened batch: {flattened_batch.shape}")
+    
     # Extract poses and text descriptions from the batch
     poses = [item["pose"] for item in flattened_batch]  # List of pose tensors
     texts = [item["text"] for item in flattened_batch]  # List of tokenized text tensors
@@ -184,7 +186,7 @@ class Trainer:
             weight_decay=WEIGHT_DECAY
         )
 
-        num_batches = len(self.train_dataloader) // ACCUMULATION_STEPS
+        # num_batches = len(self.train_dataloader) // ACCUMULATION_STEPS
         # Add 1 if there are leftover batches that will trigger an optimizer step
         # if len(self.train_dataloader) % ACCUMULATION_STEPS != 0:
         #     num_batches += 1
@@ -363,7 +365,7 @@ def main():
     checkpoint_path = f"model_saves/Acc_TT_{PERCENT_TRAIN}_percentdata_lr{LEARNING_RATE}_wd{WEIGHT_DECAY}"
 
     print("Loading Train dataset")
-    trainDataset = PoseTextDataset(src_dir=src_dir,setting="train",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=PERCENT_TRAIN)
+    trainDataset = PoseTextDataset(src_dir=src_dir,setting="train_temp",tokenizer=clip_tokenizer, joint_num=22, max_len=77,use_percentage=PERCENT_TRAIN)
     trainDataLoader = DataLoader(trainDataset,batch_size=BATCH_SIZE,shuffle=True,num_workers=0,collate_fn=collate_fn)
     # persistent_workers=True,
     # multiprocessing_context="spawn"
