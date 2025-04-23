@@ -73,10 +73,12 @@ class PoseTransformer(BaseTransformer):
         t_emb = self.timestep_embedding(timesteps)  # (batch_size, embedding_dim)
         pose_embeddings += t_emb.unsqueeze(1)  # Broadcast to (batch_size, seq_len, embedding_di
 
-        encoded_poses = self.transformer_encoder(pose_embeddings, src_key_padding_mask=pose_mask)
+        encoded_poses = self.transformer_encoder(
+            pose_embeddings,
+            src_key_padding_mask=pose_mask
+        )
 
         return encoded_poses 
-        # return encoded_poses
 
 class CrossModalTransformer(BaseTransformer):
     def __init__(self, pose_dim, memory_dim, embedding_dim, num_heads, num_layers, use_encoder = False, use_decoder= True, max_seq_len=512, dropout=0.1):
